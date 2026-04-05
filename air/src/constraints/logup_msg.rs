@@ -660,6 +660,188 @@ impl<E: PrimeCharacteristicRing + Clone> LogCapacityMsg<E> {
     }
 }
 
+// SIBLING TABLE MESSAGE
+// ================================================================================================
+
+/// Sibling table message for Merkle path operations (sparse encoding).
+///
+/// Encodes the sibling node value during Merkle path verification/update. The encoding
+/// uses `encode_sparse` at non-consecutive beta positions, with the bit selecting which
+/// half of the hasher rate holds the sibling:
+/// - `bit = 0` → sibling at h[4..7], layout `[2, 7, 8, 9, 10]`
+/// - `bit = 1` → sibling at h[0..3], layout `[2, 3, 4, 5, 6]`
+#[derive(Clone)]
+pub struct SiblingMsg<E> {
+    pub node_index: E,
+    pub bit: E,
+    /// Hasher state h[0..4] (RATE0).
+    pub h_lo: [E; 4],
+    /// Hasher state h[4..8] (RATE1).
+    pub h_hi: [E; 4],
+}
+
+impl<E: PrimeCharacteristicRing + Clone> SiblingMsg<E> {
+    /// Sibling at h[4..7]: positions [2, 7, 8, 9, 10].
+    const B0_LAYOUT: [usize; 5] = [2, 7, 8, 9, 10];
+    /// Sibling at h[0..3]: positions [2, 3, 4, 5, 6].
+    const B1_LAYOUT: [usize; 5] = [2, 3, 4, 5, 6];
+
+    pub fn encode<EF>(&self, challenges: &Challenges<EF>) -> EF
+    where
+        EF: PrimeCharacteristicRing + Algebra<E>,
+    {
+        let v_b0 = challenges.encode_sparse(
+            Self::B0_LAYOUT,
+            [
+                self.node_index.clone(),
+                self.h_hi[0].clone(),
+                self.h_hi[1].clone(),
+                self.h_hi[2].clone(),
+                self.h_hi[3].clone(),
+            ],
+        );
+        let v_b1 = challenges.encode_sparse(
+            Self::B1_LAYOUT,
+            [
+                self.node_index.clone(),
+                self.h_lo[0].clone(),
+                self.h_lo[1].clone(),
+                self.h_lo[2].clone(),
+                self.h_lo[3].clone(),
+            ],
+        );
+        v_b0 * (E::ONE - self.bit.clone()) + v_b1 * self.bit.clone()
+    }
+}
+
+// ACE WIRING MESSAGE
+// ================================================================================================
+
+/// ACE wiring bus message (5 elements): `[clk, ctx, id, v0, v1]`.
+///
+/// Encodes a single wire entry for the ACE wiring bus (C3). Each wire carries
+/// an identifier and a two-coefficient extension-field value.
+#[derive(Clone)]
+pub struct AceWireMsg<E> {
+    pub clk: E,
+    pub ctx: E,
+    pub id: E,
+    pub v0: E,
+    pub v1: E,
+}
+
+impl<E: PrimeCharacteristicRing + Clone> AceWireMsg<E> {
+    pub fn encode<EF>(&self, challenges: &Challenges<EF>) -> EF
+    where
+        EF: PrimeCharacteristicRing + Algebra<E>,
+    {
+        challenges.encode([
+            self.clk.clone(),
+            self.ctx.clone(),
+            self.id.clone(),
+            self.v0.clone(),
+            self.v1.clone(),
+        ])
+    }
+}
+
+// CHIPLET RESPONSE MESSAGES
+// ================================================================================================
+
+/// Memory chiplet response message with conditional element/word encoding.
+///
+/// The chiplet-side memory response must select between element access (5 fields) and
+/// word access (8 fields) based on `is_word`. The label, address, and element are all
+/// pre-computed from the chiplet columns (including the idx0/idx1 element mux).
+#[derive(Clone)]
+pub struct MemoryResponseMsg<E> {
+    pub label: E,
+    pub ctx: E,
+    pub addr: E,
+    pub clk: E,
+    pub is_word: E,
+    pub element: E,
+    pub word: [E; 4],
+}
+
+impl<E: PrimeCharacteristicRing + Clone> MemoryResponseMsg<E> {
+    pub fn encode<EF>(&self, challenges: &Challenges<EF>) -> EF
+    where
+        EF: PrimeCharacteristicRing + Algebra<E>,
+    {
+        let element_msg = challenges.encode([
+            self.label.clone(),
+            self.ctx.clone(),
+            self.addr.clone(),
+            self.clk.clone(),
+            self.element.clone(),
+        ]);
+        let word_msg = challenges.encode([
+            self.label.clone(),
+            self.ctx.clone(),
+            self.addr.clone(),
+            self.clk.clone(),
+            self.word[0].clone(),
+            self.word[1].clone(),
+            self.word[2].clone(),
+            self.word[3].clone(),
+        ]);
+        let is_element: E = E::ONE - self.is_word.clone();
+        element_msg * is_element + word_msg * self.is_word.clone()
+    }
+}
+
+/// Kernel ROM response message with a pre-computed (conditional) label expression.
+///
+/// The chiplet-side label depends on `s_first`: `s_first*INIT_LABEL + (1-s_first)*CALL_LABEL`.
+/// Unlike [`KernelRomMsg`] which bakes in a fixed label, this carries the label as an expression.
+#[derive(Clone)]
+pub struct KernelRomResponseMsg<E> {
+    pub label: E,
+    pub digest: [E; 4],
+}
+
+impl<E: PrimeCharacteristicRing + Clone> KernelRomResponseMsg<E> {
+    pub fn encode<EF>(&self, challenges: &Challenges<EF>) -> EF
+    where
+        EF: PrimeCharacteristicRing + Algebra<E>,
+    {
+        challenges.encode([
+            self.label.clone(),
+            self.digest[0].clone(),
+            self.digest[1].clone(),
+            self.digest[2].clone(),
+            self.digest[3].clone(),
+        ])
+    }
+}
+
+/// Bitwise chiplet response message with a pre-computed (conditional) label expression.
+///
+/// The chiplet-side label is `(1-sel)*AND_LABEL + sel*XOR_LABEL`. Unlike [`BitwiseMsg`]
+/// which bakes in a fixed label, this carries the label as an expression.
+#[derive(Clone)]
+pub struct BitwiseResponseMsg<E> {
+    pub label: E,
+    pub a: E,
+    pub b: E,
+    pub z: E,
+}
+
+impl<E: PrimeCharacteristicRing + Clone> BitwiseResponseMsg<E> {
+    pub fn encode<EF>(&self, challenges: &Challenges<EF>) -> EF
+    where
+        EF: PrimeCharacteristicRing + Algebra<E>,
+    {
+        challenges.encode([
+            self.label.clone(),
+            self.a.clone(),
+            self.b.clone(),
+            self.z.clone(),
+        ])
+    }
+}
+
 // TRAIT IMPLEMENTATIONS
 // ================================================================================================
 
@@ -688,3 +870,8 @@ impl_logup_message!(KernelRomMsg);
 impl_logup_message!(AceInitMsg);
 impl_logup_message!(RangeMsg);
 impl_logup_message!(LogCapacityMsg);
+impl_logup_message!(SiblingMsg);
+impl_logup_message!(AceWireMsg);
+impl_logup_message!(MemoryResponseMsg);
+impl_logup_message!(KernelRomResponseMsg);
+impl_logup_message!(BitwiseResponseMsg);

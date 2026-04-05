@@ -13,9 +13,10 @@
 use core::marker::PhantomData;
 
 use miden_core::field::{Algebra, PrimeCharacteristicRing};
+use miden_crypto::stark::air::{ExtensionBuilder, LiftedAirBuilder};
 
 use super::logup_msg::LogUpMessage;
-use crate::trace::Challenges;
+use crate::{Felt, trace::Challenges};
 
 // BATCH OF SIMULTANEOUS INTERACTIONS
 // ================================================================================================
@@ -34,8 +35,8 @@ use crate::trace::Challenges;
 /// - `D ← D · v`
 pub struct Batch<'c, E, EF: PrimeCharacteristicRing> {
     challenges: &'c Challenges<EF>,
-    pub n: EF,
-    pub d: EF,
+    n: EF,
+    d: EF,
     _phantom: PhantomData<E>,
 }
 
@@ -61,7 +62,7 @@ where
 
     /// Absorb a remove interaction (multiplicity = −1).
     pub fn remove(&mut self, msg: impl LogUpMessage<E, EF>) {
-        self.insert(E::ZERO - E::ONE, msg);
+        self.insert(E::NEG_ONE, msg);
     }
 
     /// Absorb an interaction with arbitrary base-field multiplicity.
@@ -88,8 +89,8 @@ where
 /// When selector `sᵣ = 1`: `U = Dᵣ, V = Nᵣ` (contributes `Nᵣ / Dᵣ`).
 pub struct RationalSet<'c, E, EF: PrimeCharacteristicRing> {
     challenges: &'c Challenges<EF>,
-    pub u: EF,
-    pub v: EF,
+    u: EF,
+    v: EF,
     _phantom: PhantomData<E>,
 }
 
@@ -110,46 +111,89 @@ where
 
     /// Add a selector-gated single insert interaction: `+1 / v`.
     ///
-    /// The message is constructed lazily via a closure, allowing future implementations
-    /// to skip construction when the selector is zero.
+    /// Equivalent to `fold_batch(selector, Batch { N=1, D=v })` but avoids
+    /// constructing a Batch and the redundant `selector * 1` multiply for V.
     pub fn add_single<M: LogUpMessage<E, EF>>(&mut self, selector: E, msg_fn: impl FnOnce() -> M) {
-        let mut b = Batch::new(self.challenges);
-        b.add(msg_fn());
-        self.fold_batch(selector, b);
+        let v: EF = msg_fn().encode(self.challenges);
+        self.u += (v - EF::ONE) * selector.clone();
+        self.v += selector;
     }
 
     /// Add a selector-gated single remove interaction: `−1 / v`.
     ///
-    /// The message is constructed lazily via a closure.
+    /// Equivalent to `fold_batch(selector, Batch { N=-1, D=v })` but avoids
+    /// constructing a Batch and the redundant `selector * (-1)` multiply for V.
     pub fn remove_single<M: LogUpMessage<E, EF>>(
         &mut self,
         selector: E,
         msg_fn: impl FnOnce() -> M,
     ) {
-        let mut b = Batch::new(self.challenges);
-        b.remove(msg_fn());
-        self.fold_batch(selector, b);
+        let v: EF = msg_fn().encode(self.challenges);
+        self.u += (v - EF::ONE) * selector.clone();
+        self.v -= selector;
     }
 
     /// Add a selector-gated single interaction with arbitrary multiplicity: `m / v`.
-    ///
-    /// The message is constructed lazily via a closure.
     pub fn insert_single<M: LogUpMessage<E, EF>>(
         &mut self,
         selector: E,
         m: E,
         msg_fn: impl FnOnce() -> M,
     ) {
-        let mut b = Batch::new(self.challenges);
-        b.insert(m, msg_fn());
-        self.fold_batch(selector, b);
+        let v: EF = msg_fn().encode(self.challenges);
+        self.u += (v - EF::ONE) * selector.clone();
+        self.v += selector * m;
+    }
+
+    /// Accumulate a shared-denominator interaction from multiple ME flags with known
+    /// multiplicities.
+    ///
+    /// Each `(flag, multiplicity)` pair contributes `multiplicity / v` when `flag = 1`.
+    /// The gate `Σ flag_i` controls U, while the numerator `Σ m_i · flag_i` contributes
+    /// to V directly — avoiding the degree blowup of `insert_single(gate, numerator, msg)`.
+    ///
+    /// **Caller proof obligation**: the flags are ME booleans.
+    pub fn insert_me<M: LogUpMessage<E, EF>, const N: usize>(
+        &mut self,
+        entries: [(E, E); N],
+        msg_fn: impl FnOnce() -> M,
+    ) {
+        const { assert!(N > 0) };
+        let v: EF = msg_fn().encode(self.challenges);
+        let (gate, numerator) = entries
+            .into_iter()
+            .map(|(flag, m)| (flag.clone(), m * flag))
+            .reduce(|(g, n), (g2, n2)| (g + g2, n + n2))
+            .unwrap();
+        self.u += (v - EF::ONE) * gate;
+        self.v += numerator;
+    }
+
+    /// Specialized `insert_me` for the virtual-table add/remove pattern: `+1 / v` when
+    /// `f_add = 1`, `−1 / v` when `f_remove = 1`.
+    ///
+    /// No multiplies for the numerator — just `f_add − f_remove` (addition/subtraction only).
+    ///
+    /// **Caller proof obligation**: `f_add` and `f_remove` are ME booleans.
+    pub fn replace<M: LogUpMessage<E, EF>>(
+        &mut self,
+        f_add: E,
+        f_remove: E,
+        msg_fn: impl FnOnce() -> M,
+    ) {
+        let v: EF = msg_fn().encode(self.challenges);
+        let gate = f_add.clone() + f_remove.clone();
+        let numerator = f_add - f_remove;
+        self.u += (v - EF::ONE) * gate;
+        self.v += numerator;
     }
 
     /// Add a selector-gated batch of simultaneous interactions.
     pub fn add_batch(&mut self, selector: E, build: impl FnOnce(&mut Batch<'c, E, EF>)) {
         let mut b = Batch::new(self.challenges);
         build(&mut b);
-        self.fold_batch(selector, b);
+        self.u += (b.d - EF::ONE) * selector.clone();
+        self.v += b.n * selector;
     }
 
     /// Create a set for an always-active interaction (no selector gating).
@@ -166,12 +210,6 @@ where
             _phantom: PhantomData,
         }
     }
-
-    /// Fold a completed batch with its selector into the running `(U, V)` pair.
-    fn fold_batch(&mut self, selector: E, batch: Batch<'c, E, EF>) {
-        self.u += (batch.d - EF::ONE) * selector.clone();
-        self.v += batch.n * selector;
-    }
 }
 
 // COLUMN ACCUMULATOR
@@ -187,10 +225,13 @@ where
 /// - `V ← V · Ũ + Ṽ · U`
 /// - `U ← U · Ũ`
 ///
-/// The final constraint for this column is `Δ · U − V = 0` where `Δ = acc_next − acc`.
+/// Initialized with the accumulator values `acc` and `acc_next` from the auxiliary trace.
+/// Call [`Column::constrain`] to emit first-row, transition, and last-row constraints.
 pub struct Column<E, EF> {
-    pub u: EF,
-    pub v: EF,
+    acc: EF,
+    acc_next: EF,
+    u: EF,
+    v: EF,
     _phantom: PhantomData<E>,
 }
 
@@ -199,18 +240,23 @@ where
     E: PrimeCharacteristicRing + Clone,
     EF: PrimeCharacteristicRing + Clone + Algebra<E>,
 {
-    /// Empty column: `U = 1, V = 0`.
-    pub fn new() -> Self {
+    /// Create a column bound to accumulator values, containing exactly one set.
+    pub fn from_set(acc: EF, acc_next: EF, set: RationalSet<'_, E, EF>) -> Self {
         Self {
-            u: EF::ONE,
-            v: EF::ZERO,
+            acc,
+            acc_next,
+            u: set.u,
+            v: set.v,
             _phantom: PhantomData,
         }
     }
 
-    /// Create a column containing exactly one set.
-    pub fn from_set(set: RationalSet<'_, E, EF>) -> Self {
+    /// Create an unbound column from a single set (for testing the algebra).
+    #[cfg(test)]
+    pub fn from_set_unbound(set: RationalSet<'_, E, EF>) -> Self {
         Self {
+            acc: EF::ZERO,
+            acc_next: EF::ZERO,
             u: set.u,
             v: set.v,
             _phantom: PhantomData,
@@ -223,9 +269,31 @@ where
         self.u = self.u.clone() * set.u;
     }
 
-    /// Return the constraint expression `Δ · U − V`.
+    /// Return the constraint expression `Δ · U − V` for a given delta.
+    #[cfg(test)]
     pub fn constraint(&self, delta: EF) -> EF {
         delta * self.u.clone() - self.v.clone()
+    }
+
+    /// Emit all constraints for this column and consume it.
+    ///
+    /// - **First row**: `acc = 0`
+    /// - **Transition**: `Δ · U − V = 0` where `Δ = acc_next − acc`
+    /// - **Last row**: `acc = 0` (temporary — will be replaced by public-input binding)
+    pub fn constrain<AB>(self, builder: &mut AB)
+    where
+        AB: LiftedAirBuilder<F = Felt>,
+        AB::ExprEF: From<EF>,
+    {
+        let acc: AB::ExprEF = self.acc.into();
+        let acc_next: AB::ExprEF = self.acc_next.into();
+        let u: AB::ExprEF = self.u.into();
+        let v: AB::ExprEF = self.v.into();
+        let delta = acc_next - acc.clone();
+
+        builder.when_first_row().assert_zero_ext(acc.clone());
+        builder.when_transition().assert_zero_ext(delta * u - v);
+        builder.when_last_row().assert_zero_ext(acc);
     }
 }
 
@@ -349,7 +417,7 @@ mod tests {
         let mut set2 = S::new(&ch);
         set2.add_single(Felt::ONE, || TestMsg { val: Felt::new(7) });
 
-        let mut col = Column::from_set(set1);
+        let mut col = Column::from_set_unbound(set1);
         col.add_set(set2);
 
         assert_eq!(col.u, v1 * v2);
@@ -362,7 +430,7 @@ mod tests {
         let v = ch.encode([Felt::new(5)]);
         let mut set = S::new(&ch);
         set.add_single(Felt::ONE, || TestMsg { val: Felt::new(5) });
-        let col = Column::from_set(set);
+        let col = Column::from_set_unbound(set);
         assert_eq!(col.constraint(v.inverse()), EF::ZERO);
     }
 
@@ -394,7 +462,7 @@ mod tests {
         let mut set2 = S::new(&ch);
         set2.add_single(Felt::ONE, || TestMsg { val: Felt::new(7) });
 
-        let mut col = Column::from_set(set1);
+        let mut col = Column::from_set_unbound(set1);
         col.add_set(set2);
 
         let delta = v1.inverse() + v2.inverse();

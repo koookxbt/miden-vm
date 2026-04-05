@@ -15,6 +15,7 @@ use miden_core::{FMP_ADDR, FMP_INIT_VALUE, field::PrimeCharacteristicRing, opera
 use miden_crypto::stark::air::{ExtensionBuilder, LiftedAirBuilder, WindowAccess};
 
 use super::{
+    chiplets::{bitwise::P_BITWISE_K_TRANSITION, hasher},
     logup::{Column, RationalSet},
     logup_msg::*,
     op_flags::{ExprDecoderAccess, OpFlags},
@@ -22,8 +23,28 @@ use super::{
 use crate::{
     Felt, MainTraceRow,
     trace::{
-        Challenges,
-        chiplets::hasher::HASH_CYCLE_LEN,
+        CHIPLETS_OFFSET, Challenges,
+        chiplets::{
+            HASHER_NODE_INDEX_COL_IDX, HASHER_SELECTOR_COL_RANGE, HASHER_STATE_COL_RANGE,
+            NUM_ACE_SELECTORS,
+            NUM_BITWISE_SELECTORS, NUM_KERNEL_ROM_SELECTORS, NUM_MEMORY_SELECTORS,
+            ace::{
+                ACE_INSTRUCTION_ID1_OFFSET, ACE_INSTRUCTION_ID2_OFFSET, CLK_IDX,
+                CTX_IDX, EVAL_OP_IDX, ID_0_IDX, ID_1_IDX, ID_2_IDX, M_0_IDX, M_1_IDX, PTR_IDX,
+                READ_NUM_EVAL_IDX, SELECTOR_BLOCK_IDX, SELECTOR_START_IDX, V_0_0_IDX, V_0_1_IDX,
+                V_1_0_IDX, V_1_1_IDX, V_2_0_IDX, V_2_1_IDX,
+            },
+            bitwise::{self, BITWISE_AND_LABEL, BITWISE_XOR_LABEL},
+            hasher::{
+                HASH_CYCLE_LEN, LINEAR_HASH_LABEL, MP_VERIFY_LABEL, MR_UPDATE_NEW_LABEL,
+                MR_UPDATE_OLD_LABEL, RETURN_HASH_LABEL, RETURN_STATE_LABEL,
+            },
+            kernel_rom::{KERNEL_PROC_CALL_LABEL, KERNEL_PROC_INIT_LABEL},
+            memory::{
+                self, MEMORY_READ_ELEMENT_LABEL, MEMORY_READ_WORD_LABEL,
+                MEMORY_WRITE_ELEMENT_LABEL, MEMORY_WRITE_WORD_LABEL,
+            },
+        },
         decoder::{
             ADDR_COL_IDX, GROUP_COUNT_COL_IDX, HASHER_STATE_RANGE, IN_SPAN_COL_IDX,
             IS_CALL_FLAG_COL_IDX, IS_LOOP_BODY_FLAG_COL_IDX, IS_LOOP_FLAG_COL_IDX,
@@ -571,29 +592,505 @@ pub fn enforce_main<AB>(
     let aux_local = aux.current_slice();
     let aux_next = aux.next_slice();
 
-    let mut m1 = Column::from_set(g_bstack);
+    let mut m1 = Column::from_set(aux_local[main_cols::M1].into(), aux_next[main_cols::M1].into(), g_bstack);
     m1.add_set(g_rtable);
-    let delta_m1: AB::ExprEF =
-        Into::<AB::ExprEF>::into(aux_next[main_cols::M1]) - aux_local[main_cols::M1].into();
-    builder.when_transition().assert_zero_ext(m1.constraint(delta_m1));
+    m1.constrain(builder);
 
-    let m2 = Column::from_set(g_bqueue);
-    let delta_m2: AB::ExprEF =
-        Into::<AB::ExprEF>::into(aux_next[main_cols::M2]) - aux_local[main_cols::M2].into();
-    builder.when_transition().assert_zero_ext(m2.constraint(delta_m2));
-
-    let m3 = Column::from_set(g_creq);
-    let delta_m3: AB::ExprEF =
-        Into::<AB::ExprEF>::into(aux_next[main_cols::M3]) - aux_local[main_cols::M3].into();
-    builder.when_transition().assert_zero_ext(m3.constraint(delta_m3));
-
-    let m4 = Column::from_set(g_rstack_logcap);
-    let delta_m4: AB::ExprEF =
-        Into::<AB::ExprEF>::into(aux_next[main_cols::M4]) - aux_local[main_cols::M4].into();
-    builder.when_transition().assert_zero_ext(m4.constraint(delta_m4));
-
-    let m5 = Column::from_set(g_opgrp);
-    let delta_m5: AB::ExprEF =
-        Into::<AB::ExprEF>::into(aux_next[main_cols::M5]) - aux_local[main_cols::M5].into();
-    builder.when_transition().assert_zero_ext(m5.constraint(delta_m5));
+    Column::from_set(aux_local[main_cols::M2].into(), aux_next[main_cols::M2].into(), g_bqueue)
+        .constrain(builder);
+    Column::from_set(aux_local[main_cols::M3].into(), aux_next[main_cols::M3].into(), g_creq)
+        .constrain(builder);
+    Column::from_set(aux_local[main_cols::M4].into(), aux_next[main_cols::M4].into(), g_rstack_logcap)
+        .constrain(builder);
+    Column::from_set(aux_local[main_cols::M5].into(), aux_next[main_cols::M5].into(), g_opgrp)
+        .constrain(builder);
 }
+
+// CHIPLET TRACE LOGUP
+// ================================================================================================
+
+// Chiplet-local column offsets (relative to `local.chiplets[]`).
+const S_START: usize = HASHER_SELECTOR_COL_RANGE.start - CHIPLETS_OFFSET;
+const H_START: usize = HASHER_STATE_COL_RANGE.start - CHIPLETS_OFFSET;
+const IDX_COL: usize = HASHER_NODE_INDEX_COL_IDX - CHIPLETS_OFFSET;
+
+/// ACE chiplet column offset (after s0, s1, s2, s3 chiplet selectors).
+const ACE_OFFSET: usize = 4;
+
+/// Enforces all chiplet-trace LogUp bus constraints (3 columns: C1–C3).
+///
+/// - **C1** — chiplet bus responses (hasher, bitwise, memory, ACE init, kernel ROM)
+/// - **C2** — hash-kernel virtual table (sibling table + ACE memory reads)
+/// - **C3** — ACE wiring bus (READ/EVAL wire interactions)
+pub fn enforce_chiplet<AB>(
+    builder: &mut AB,
+    local: &MainTraceRow<AB::Var>,
+    next: &MainTraceRow<AB::Var>,
+) where
+    AB: LiftedAirBuilder<F = Felt>,
+{
+    let r = builder.permutation_randomness();
+    let challenges = Challenges::<AB::ExprEF>::new(r[0].into(), r[1].into());
+
+    // =====================================================================
+    // Periodic values
+    // =====================================================================
+    let (cycle_row_0, cycle_row_31, k_transition) = {
+        let p = builder.periodic_values();
+        let cycle_row_0: AB::Expr = p[hasher::periodic::P_CYCLE_ROW_0].into();
+        let cycle_row_31: AB::Expr = p[hasher::periodic::P_CYCLE_ROW_31].into();
+        let k_transition: AB::Expr = p[P_BITWISE_K_TRANSITION].into();
+        (cycle_row_0, cycle_row_31, k_transition)
+    };
+
+    // =====================================================================
+    // Chiplet selector flags
+    // =====================================================================
+    let s0: AB::Expr = local.chiplets[0].clone().into();
+    let s1: AB::Expr = local.chiplets[1].clone().into();
+    let s2: AB::Expr = local.chiplets[2].clone().into();
+    let s3: AB::Expr = local.chiplets[3].clone().into();
+    let s4: AB::Expr = local.chiplets[4].clone().into();
+
+    let is_hasher: AB::Expr = AB::Expr::ONE - s0.clone();
+
+    // Hasher internal selectors (meaningful when is_hasher = 1).
+    let hs0: AB::Expr = local.chiplets[S_START].clone().into();
+    let hs1: AB::Expr = local.chiplets[S_START + 1].clone().into();
+    let hs2: AB::Expr = local.chiplets[S_START + 2].clone().into();
+
+    // Hasher state (12 elements) and node index.
+    let h: [AB::Expr; 12] = array::from_fn(|i| local.chiplets[H_START + i].clone().into());
+    let h_next: [AB::Expr; 12] = array::from_fn(|i| next.chiplets[H_START + i].clone().into());
+    let node_index: AB::Expr = local.chiplets[IDX_COL].clone().into();
+    let node_index_next: AB::Expr = next.chiplets[IDX_COL].clone().into();
+
+    // Hasher addr proxy: clk + 1 (hasher row address is clk-based).
+    let hasher_addr: AB::Expr = local.clk.clone().into() + AB::Expr::ONE;
+
+    // Bit for conditional leaf selection: bit = node_index - 2 * node_index_next.
+    let bit: AB::Expr = node_index.clone() - node_index_next.clone().double();
+
+    // =====================================================================
+    // C1: Chiplet bus responses
+    // =====================================================================
+    let g_chiplet_resp = {
+        let mut set = RationalSet::new(&challenges);
+
+        // --- Hasher responses (7 ME flags, each degree 5 within is_hasher) ---
+
+        // f_bp: linear hash / 2-to-1 hash init — full 15-element state.
+        let f = is_hasher.clone()
+            * hasher::flags::f_bp(
+                cycle_row_0.clone(),
+                hs0.clone(),
+                hs1.clone(),
+                hs2.clone(),
+            );
+        set.add_single(f, || {
+            HasherMsg::State {
+                label_value: LINEAR_HASH_LABEL as u16 + 16,
+                addr: hasher_addr.clone(),
+                node_index: node_index.clone(),
+                state: h.clone(),
+            }
+        });
+
+        // f_mp: Merkle path verify init — conditional leaf word.
+        let f = is_hasher.clone()
+            * hasher::flags::f_mp(
+                cycle_row_0.clone(),
+                hs0.clone(),
+                hs1.clone(),
+                hs2.clone(),
+            );
+        set.add_single(f, || {
+            HasherMsg::Word {
+                label_value: MP_VERIFY_LABEL as u16 + 16,
+                addr: hasher_addr.clone(),
+                node_index: node_index.clone(),
+                word: leaf_word(&h, &bit),
+            }
+        });
+
+        // f_mv: Merkle update old path init — conditional leaf word.
+        let f = is_hasher.clone()
+            * hasher::flags::f_mv(
+                cycle_row_0.clone(),
+                hs0.clone(),
+                hs1.clone(),
+                hs2.clone(),
+            );
+        set.add_single(f, || {
+            HasherMsg::Word {
+                label_value: MR_UPDATE_OLD_LABEL as u16 + 16,
+                addr: hasher_addr.clone(),
+                node_index: node_index.clone(),
+                word: leaf_word(&h, &bit),
+            }
+        });
+
+        // f_mu: Merkle update new path init — conditional leaf word.
+        let f = is_hasher.clone()
+            * hasher::flags::f_mu(
+                cycle_row_0.clone(),
+                hs0.clone(),
+                hs1.clone(),
+                hs2.clone(),
+            );
+        set.add_single(f, || {
+            HasherMsg::Word {
+                label_value: MR_UPDATE_NEW_LABEL as u16 + 16,
+                addr: hasher_addr.clone(),
+                node_index: node_index.clone(),
+                word: leaf_word(&h, &bit),
+            }
+        });
+
+        // f_hout: return hash — 4-element digest from RATE0.
+        let f = is_hasher.clone()
+            * hasher::flags::f_hout(
+                cycle_row_31.clone(),
+                hs0.clone(),
+                hs1.clone(),
+                hs2.clone(),
+            );
+        set.add_single(f, || {
+            HasherMsg::Word {
+                label_value: RETURN_HASH_LABEL as u16 + 32,
+                addr: hasher_addr.clone(),
+                node_index: node_index.clone(),
+                word: [h[0].clone(), h[1].clone(), h[2].clone(), h[3].clone()],
+            }
+        });
+
+        // f_sout: return full state — 15-element state message.
+        let f = is_hasher.clone()
+            * hasher::flags::f_sout(
+                cycle_row_31.clone(),
+                hs0.clone(),
+                hs1.clone(),
+                hs2.clone(),
+            );
+        set.add_single(f, || {
+            HasherMsg::State {
+                label_value: RETURN_STATE_LABEL as u16 + 32,
+                addr: hasher_addr.clone(),
+                node_index: node_index.clone(),
+                state: h.clone(),
+            }
+        });
+
+        // f_abp: absorption — 8-element rate from the NEXT row.
+        let f = is_hasher.clone()
+            * hasher::flags::f_abp(
+                cycle_row_31.clone(),
+                hs0.clone(),
+                hs1.clone(),
+                hs2.clone(),
+            );
+        set.add_single(f, || {
+            HasherMsg::Rate {
+                label_value: LINEAR_HASH_LABEL as u16 + 32,
+                addr: hasher_addr.clone(),
+                node_index: node_index.clone(),
+                rate: array::from_fn(|i| h_next[i].clone()),
+            }
+        });
+
+        // --- Bitwise response (flag deg 4) ---
+        // Active on last row of 8-row cycle: s0*(1-s1)*(1-k_transition).
+        let is_bitwise_responding: AB::Expr =
+            s0.clone() * (AB::Expr::ONE - s1.clone()) * (AB::Expr::ONE - k_transition);
+        set.add_single(is_bitwise_responding, || {
+            let bw_offset = NUM_BITWISE_SELECTORS;
+            let sel: AB::Expr = local.chiplets[bw_offset].clone().into();
+            let label: AB::Expr = (AB::Expr::ONE - sel.clone()) * AB::Expr::from(BITWISE_AND_LABEL)
+                + sel * AB::Expr::from(BITWISE_XOR_LABEL);
+            let a: AB::Expr = local.chiplets[bw_offset + bitwise::A_COL_IDX].clone().into();
+            let b: AB::Expr = local.chiplets[bw_offset + bitwise::B_COL_IDX].clone().into();
+            let z: AB::Expr = local.chiplets[bw_offset + bitwise::OUTPUT_COL_IDX].clone().into();
+            BitwiseResponseMsg { label, a, b, z }
+        });
+
+        // --- Memory response (flag deg 3) ---
+        // Active on all memory rows: s0*s1*(1-s2).
+        let is_memory: AB::Expr =
+            s0.clone() * s1.clone() * (AB::Expr::ONE - s2.clone());
+        set.add_single(is_memory, || {
+            compute_memory_response_msg::<AB>(local)
+        });
+
+        // --- ACE init response (flag deg 5) ---
+        // Active on ACE start rows: s0*s1*s2*(1-s3)*start_sel.
+        let ace_start: AB::Expr = local.chiplets[NUM_ACE_SELECTORS + SELECTOR_START_IDX]
+            .clone()
+            .into();
+        let is_ace: AB::Expr =
+            s0.clone() * s1.clone() * s2.clone() * (AB::Expr::ONE - s3.clone()) * ace_start;
+        set.add_single(is_ace, || {
+            let clk: AB::Expr = local.chiplets[NUM_ACE_SELECTORS + CLK_IDX].clone().into();
+            let ctx: AB::Expr = local.chiplets[NUM_ACE_SELECTORS + CTX_IDX].clone().into();
+            let ptr: AB::Expr = local.chiplets[NUM_ACE_SELECTORS + PTR_IDX].clone().into();
+            let read_num_eval: AB::Expr =
+                local.chiplets[NUM_ACE_SELECTORS + READ_NUM_EVAL_IDX].clone().into();
+            let num_eval_rows: AB::Expr = read_num_eval + AB::Expr::ONE;
+            let id_0: AB::Expr = local.chiplets[NUM_ACE_SELECTORS + ID_0_IDX].clone().into();
+            let num_read_rows: AB::Expr = id_0 + AB::Expr::ONE - num_eval_rows.clone();
+            AceInitMsg { clk, ctx, ptr, num_read: num_read_rows, num_eval: num_eval_rows }
+        });
+
+        // --- Kernel ROM response (flag deg 5) ---
+        // Active on all kernel ROM rows: s0*s1*s2*s3*(1-s4).
+        let is_kernel_rom: AB::Expr =
+            s0.clone() * s1.clone() * s2.clone() * s3.clone() * (AB::Expr::ONE - s4.clone());
+        set.add_single(is_kernel_rom, || {
+            let s_first: AB::Expr = local.chiplets[NUM_KERNEL_ROM_SELECTORS].clone().into();
+            let init_label: AB::Expr = AB::Expr::from(KERNEL_PROC_INIT_LABEL);
+            let call_label: AB::Expr = AB::Expr::from(KERNEL_PROC_CALL_LABEL);
+            let label: AB::Expr =
+                s_first.clone() * init_label + (AB::Expr::ONE - s_first) * call_label;
+            let root0: AB::Expr =
+                local.chiplets[NUM_KERNEL_ROM_SELECTORS + 1].clone().into();
+            let root1: AB::Expr =
+                local.chiplets[NUM_KERNEL_ROM_SELECTORS + 2].clone().into();
+            let root2: AB::Expr =
+                local.chiplets[NUM_KERNEL_ROM_SELECTORS + 3].clone().into();
+            let root3: AB::Expr =
+                local.chiplets[NUM_KERNEL_ROM_SELECTORS + 4].clone().into();
+            KernelRomResponseMsg { label, digest: [root0, root1, root2, root3] }
+        });
+
+        set
+    };
+
+    // Shared sibling msg constructors.
+    let sibling_curr = || SiblingMsg {
+        node_index: node_index.clone(),
+        bit: bit.clone(),
+        h_lo: array::from_fn(|i| h[i].clone()),
+        h_hi: array::from_fn(|i| h[4 + i].clone()),
+    };
+    let sibling_next = || SiblingMsg {
+        node_index: node_index.clone(),
+        bit: bit.clone(),
+        h_lo: array::from_fn(|i| h_next[i].clone()),
+        h_hi: array::from_fn(|i| h_next[4 + i].clone()),
+    };
+
+    // =====================================================================
+    // C2: Hash-kernel virtual table (sibling table + ACE memory reads)
+    // =====================================================================
+    let g_hash_kernel = {
+        let mut set = RationalSet::new(&challenges);
+
+        // --- Sibling table ---
+        // MV/MVA: add (response — store sibling during old Merkle path).
+        // MU/MUA: remove (request — retrieve sibling during new Merkle path).
+
+        let f_mv: AB::Expr = is_hasher.clone()
+            * hasher::flags::f_mv(cycle_row_0.clone(), hs0.clone(), hs1.clone(), hs2.clone());
+        let f_mu: AB::Expr = is_hasher.clone()
+            * hasher::flags::f_mu(cycle_row_0.clone(), hs0.clone(), hs1.clone(), hs2.clone());
+        let f_mva: AB::Expr = is_hasher.clone()
+            * hasher::flags::f_mva(
+                cycle_row_31.clone(),
+                hs0.clone(),
+                hs1.clone(),
+                hs2.clone(),
+            );
+        let f_mua: AB::Expr = is_hasher.clone()
+            * hasher::flags::f_mua(cycle_row_31, hs0, hs1, hs2);
+
+        // MV (+1) and MU (-1) share sibling_curr.
+        set.replace(f_mv, f_mu, sibling_curr);
+        // MVA (+1) and MUA (-1) share sibling_next.
+        set.replace(f_mva, f_mua, sibling_next);
+
+        // --- ACE memory reads ---
+        let is_ace_row: AB::Expr =
+            s0.clone() * s1.clone() * s2.clone() * (AB::Expr::ONE - s3.clone());
+        let block_sel: AB::Expr =
+            local.chiplets[NUM_ACE_SELECTORS + SELECTOR_BLOCK_IDX].clone().into();
+
+        // f_ace_read: word read on READ rows.
+        let f_ace_read: AB::Expr = is_ace_row.clone() * (AB::Expr::ONE - block_sel.clone());
+        set.remove_single(f_ace_read, || {
+            let ace_clk: AB::Expr = local.chiplets[NUM_ACE_SELECTORS + CLK_IDX].clone().into();
+            let ace_ctx: AB::Expr = local.chiplets[NUM_ACE_SELECTORS + CTX_IDX].clone().into();
+            let ace_ptr: AB::Expr = local.chiplets[NUM_ACE_SELECTORS + PTR_IDX].clone().into();
+            let v0_0: AB::Expr = local.chiplets[NUM_ACE_SELECTORS + V_0_0_IDX].clone().into();
+            let v0_1: AB::Expr = local.chiplets[NUM_ACE_SELECTORS + V_0_1_IDX].clone().into();
+            let v1_0: AB::Expr = local.chiplets[NUM_ACE_SELECTORS + V_1_0_IDX].clone().into();
+            let v1_1: AB::Expr = local.chiplets[NUM_ACE_SELECTORS + V_1_1_IDX].clone().into();
+            MemoryMsg::Word {
+                op_value: MEMORY_READ_WORD_LABEL as u16,
+                header: MemoryHeader {
+                    ctx: ace_ctx,
+                    addr: ace_ptr,
+                    clk: ace_clk,
+                },
+                word: [v0_0, v0_1, v1_0, v1_1],
+            }
+        });
+
+        // f_ace_eval: element read on EVAL rows.
+        let f_ace_eval: AB::Expr = is_ace_row * block_sel;
+        set.remove_single(f_ace_eval, || {
+            let ace_clk: AB::Expr = local.chiplets[NUM_ACE_SELECTORS + CLK_IDX].clone().into();
+            let ace_ctx: AB::Expr = local.chiplets[NUM_ACE_SELECTORS + CTX_IDX].clone().into();
+            let ace_ptr: AB::Expr = local.chiplets[NUM_ACE_SELECTORS + PTR_IDX].clone().into();
+            let id_1: AB::Expr = local.chiplets[NUM_ACE_SELECTORS + ID_1_IDX].clone().into();
+            let id_2: AB::Expr = local.chiplets[NUM_ACE_SELECTORS + ID_2_IDX].clone().into();
+            let eval_op: AB::Expr =
+                local.chiplets[NUM_ACE_SELECTORS + EVAL_OP_IDX].clone().into();
+            let element: AB::Expr = id_1
+                + id_2 * AB::Expr::from(ACE_INSTRUCTION_ID1_OFFSET)
+                + (eval_op + AB::Expr::ONE) * AB::Expr::from(ACE_INSTRUCTION_ID2_OFFSET);
+            MemoryMsg::Element {
+                op_value: MEMORY_READ_ELEMENT_LABEL as u16,
+                header: MemoryHeader {
+                    ctx: ace_ctx,
+                    addr: ace_ptr,
+                    clk: ace_clk,
+                },
+                element,
+            }
+        });
+
+        set
+    };
+
+    // =====================================================================
+    // C3: ACE wiring bus
+    // =====================================================================
+    let g_wiring = {
+        let mut set = RationalSet::new(&challenges);
+
+        let ace_flag: AB::Expr =
+            s0.clone() * s1.clone() * s2.clone() * (AB::Expr::ONE - s3.clone());
+        let sblock: AB::Expr =
+            local.chiplets[ACE_OFFSET + SELECTOR_BLOCK_IDX].clone().into();
+        let is_read: AB::Expr = ace_flag.clone() * (AB::Expr::ONE - sblock.clone());
+        let is_eval: AB::Expr = ace_flag * sblock;
+
+        let clk: AB::Expr = local.chiplets[ACE_OFFSET + CLK_IDX].clone().into();
+        let ctx: AB::Expr = local.chiplets[ACE_OFFSET + CTX_IDX].clone().into();
+        let m0: AB::Expr = local.chiplets[ACE_OFFSET + M_0_IDX].clone().into();
+        let m1: AB::Expr = local.chiplets[ACE_OFFSET + M_1_IDX].clone().into();
+
+        let wire_0 = AceWireMsg {
+            clk: clk.clone(),
+            ctx: ctx.clone(),
+            id: local.chiplets[ACE_OFFSET + ID_0_IDX].clone().into(),
+            v0: local.chiplets[ACE_OFFSET + V_0_0_IDX].clone().into(),
+            v1: local.chiplets[ACE_OFFSET + V_0_1_IDX].clone().into(),
+        };
+        let wire_1 = AceWireMsg {
+            clk: clk.clone(),
+            ctx: ctx.clone(),
+            id: local.chiplets[ACE_OFFSET + ID_1_IDX].clone().into(),
+            v0: local.chiplets[ACE_OFFSET + V_1_0_IDX].clone().into(),
+            v1: local.chiplets[ACE_OFFSET + V_1_1_IDX].clone().into(),
+        };
+        let wire_2 = AceWireMsg {
+            clk: clk.clone(),
+            ctx: ctx.clone(),
+            id: local.chiplets[ACE_OFFSET + ID_2_IDX].clone().into(),
+            v0: local.chiplets[ACE_OFFSET + V_2_0_IDX].clone().into(),
+            v1: local.chiplets[ACE_OFFSET + V_2_1_IDX].clone().into(),
+        };
+
+        // READ batch: insert wire_0 (m0 times) + insert wire_1 (m1 times).
+        set.add_batch(is_read, |b| {
+            b.insert(m0.clone(), wire_0.clone());
+            b.insert(m1, wire_1.clone());
+        });
+
+        // EVAL batch: insert wire_0 (m0 times) + remove wire_1 + remove wire_2.
+        set.add_batch(is_eval, |b| {
+            b.insert(m0, wire_0);
+            b.remove(wire_1);
+            b.remove(wire_2);
+        });
+
+        set
+    };
+
+    // =====================================================================
+    // Combine groups into columns and emit constraints
+    // =====================================================================
+
+    let aux = builder.permutation();
+    let aux_local = aux.current_slice();
+    let aux_next = aux.next_slice();
+
+    Column::from_set(aux_local[chip_cols::C1].into(), aux_next[chip_cols::C1].into(), g_chiplet_resp)
+        .constrain(builder);
+    Column::from_set(aux_local[chip_cols::C2].into(), aux_next[chip_cols::C2].into(), g_hash_kernel)
+        .constrain(builder);
+    Column::from_set(aux_local[chip_cols::C3].into(), aux_next[chip_cols::C3].into(), g_wiring)
+        .constrain(builder);
+}
+
+// CHIPLET RESPONSE HELPERS
+// ================================================================================================
+
+/// Compute the conditional leaf word for Merkle path operations.
+///
+/// When `bit = 0`, selects `h[0..4]` (RATE0); when `bit = 1`, selects `h[4..8]` (RATE1).
+fn leaf_word<E: PrimeCharacteristicRing + Clone>(h: &[E; 12], bit: &E) -> [E; 4] {
+    array::from_fn(|i| {
+        (E::ONE - bit.clone()) * h[i].clone() + bit.clone() * h[i + 4].clone()
+    })
+}
+
+/// Compute the memory chiplet response message value.
+///
+/// Encodes `[label, ctx, addr, clk, data...]` where label depends on is_read/is_word flags,
+/// addr = word + 2*idx1 + idx0, and data is either a single element (muxed by idx0/idx1)
+/// or a full 4-element word.
+fn compute_memory_response_msg<AB: LiftedAirBuilder<F = Felt>>(
+    local: &MainTraceRow<AB::Var>,
+) -> MemoryResponseMsg<AB::Expr> {
+    let mem_offset = NUM_MEMORY_SELECTORS;
+    let is_read: AB::Expr = local.chiplets[mem_offset + memory::IS_READ_COL_IDX].clone().into();
+    let is_word: AB::Expr =
+        local.chiplets[mem_offset + memory::IS_WORD_ACCESS_COL_IDX].clone().into();
+    let ctx: AB::Expr = local.chiplets[mem_offset + memory::CTX_COL_IDX].clone().into();
+    let word: AB::Expr = local.chiplets[mem_offset + memory::WORD_COL_IDX].clone().into();
+    let idx0: AB::Expr = local.chiplets[mem_offset + memory::IDX0_COL_IDX].clone().into();
+    let idx1: AB::Expr = local.chiplets[mem_offset + memory::IDX1_COL_IDX].clone().into();
+    let clk: AB::Expr = local.chiplets[mem_offset + memory::CLK_COL_IDX].clone().into();
+
+    // Compute address: addr = word + 2*idx1 + idx0.
+    let addr: AB::Expr = word + idx1.clone() * AB::Expr::from_u16(2) + idx0.clone();
+
+    // Compute label from flags.
+    let write_element_label = AB::Expr::from_u16(MEMORY_WRITE_ELEMENT_LABEL as u16);
+    let write_word_label = AB::Expr::from_u16(MEMORY_WRITE_WORD_LABEL as u16);
+    let read_element_label = AB::Expr::from_u16(MEMORY_READ_ELEMENT_LABEL as u16);
+    let read_word_label = AB::Expr::from_u16(MEMORY_READ_WORD_LABEL as u16);
+    let write_label = (AB::Expr::ONE - is_word.clone()) * write_element_label
+        + is_word.clone() * write_word_label;
+    let read_label = (AB::Expr::ONE - is_word.clone()) * read_element_label
+        + is_word.clone() * read_word_label;
+    let label =
+        (AB::Expr::ONE - is_read.clone()) * write_label + is_read * read_label;
+
+    // Value columns.
+    let v0: AB::Expr = local.chiplets[mem_offset + memory::V_COL_RANGE.start].clone().into();
+    let v1: AB::Expr = local.chiplets[mem_offset + memory::V_COL_RANGE.start + 1].clone().into();
+    let v2: AB::Expr = local.chiplets[mem_offset + memory::V_COL_RANGE.start + 2].clone().into();
+    let v3: AB::Expr = local.chiplets[mem_offset + memory::V_COL_RANGE.start + 3].clone().into();
+
+    // Element selection: v0*(1-idx0)*(1-idx1) + v1*idx0*(1-idx1) + v2*(1-idx0)*idx1 + v3*idx0*idx1.
+    let element: AB::Expr =
+        v0.clone() * (AB::Expr::ONE - idx0.clone()) * (AB::Expr::ONE - idx1.clone())
+            + v1.clone() * idx0.clone() * (AB::Expr::ONE - idx1.clone())
+            + v2.clone() * (AB::Expr::ONE - idx0.clone()) * idx1.clone()
+            + v3.clone() * idx0 * idx1;
+
+    MemoryResponseMsg { label, ctx, addr, clk, is_word, element, word: [v0, v1, v2, v3] }
+}
+
