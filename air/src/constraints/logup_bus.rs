@@ -1094,3 +1094,94 @@ fn compute_memory_response_msg<AB: LiftedAirBuilder<F = Felt>>(
     MemoryResponseMsg { label, ctx, addr, clk, is_word, element, word: [v0, v1, v2, v3] }
 }
 
+// TESTS
+// ================================================================================================
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use std::{borrow::Borrow, println};
+
+    use miden_core::field::QuadFelt;
+    use miden_crypto::stark::air::{
+        AirBuilder, LiftedAir, WindowAccess,
+        symbolic::{AirLayout, SymbolicAirBuilder},
+    };
+
+    use crate::{
+        Felt, MainTraceRow, NUM_PUBLIC_VALUES, ProcessorAir,
+        trace::{AUX_TRACE_RAND_CHALLENGES, AUX_TRACE_WIDTH, TRACE_WIDTH},
+    };
+
+    /// Maximum allowed constraint degree (transition degree budget).
+    const DEGREE_BUDGET: usize = 9;
+
+    type SB = SymbolicAirBuilder<Felt, QuadFelt>;
+
+    fn make_builder() -> SB {
+        let num_periodic = LiftedAir::<Felt, QuadFelt>::periodic_columns(&ProcessorAir).len();
+        SymbolicAirBuilder::<Felt, QuadFelt>::new(AirLayout {
+            preprocessed_width: 0,
+            main_width: TRACE_WIDTH,
+            num_public_values: NUM_PUBLIC_VALUES,
+            permutation_width: AUX_TRACE_WIDTH,
+            num_permutation_challenges: AUX_TRACE_RAND_CHALLENGES,
+            num_permutation_values: AUX_TRACE_WIDTH,
+            num_periodic_columns: num_periodic,
+        })
+    }
+
+    #[test]
+    #[allow(clippy::print_stdout)]
+    fn enforce_main_degrees_within_budget() {
+        let mut builder = make_builder();
+        let main = builder.main();
+        let local: &MainTraceRow<_> = main.current_slice().borrow();
+        let next: &MainTraceRow<_> = main.next_slice().borrow();
+
+        super::enforce_main(&mut builder, local, next);
+
+        let ext = builder.extension_constraints();
+        println!("enforce_main: {} extension constraints", ext.len());
+        for (i, c) in ext.iter().enumerate() {
+            let deg = c.degree_multiple();
+            println!("  EXT[{i}] degree = {deg}");
+            assert!(deg <= DEGREE_BUDGET, "EXT[{i}] degree {deg} exceeds budget {DEGREE_BUDGET}");
+        }
+
+        let base = builder.base_constraints();
+        println!("enforce_main: {} base constraints", base.len());
+        for (i, c) in base.iter().enumerate() {
+            let deg = c.degree_multiple();
+            assert!(deg <= DEGREE_BUDGET, "BASE[{i}] degree {deg} exceeds budget {DEGREE_BUDGET}");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::print_stdout)]
+    fn enforce_chiplet_degrees_within_budget() {
+        let mut builder = make_builder();
+        let main = builder.main();
+        let local: &MainTraceRow<_> = main.current_slice().borrow();
+        let next: &MainTraceRow<_> = main.next_slice().borrow();
+
+        super::enforce_chiplet(&mut builder, local, next);
+
+        let ext = builder.extension_constraints();
+        println!("enforce_chiplet: {} extension constraints", ext.len());
+        for (i, c) in ext.iter().enumerate() {
+            let deg = c.degree_multiple();
+            println!("  EXT[{i}] degree = {deg}");
+            assert!(deg <= DEGREE_BUDGET, "EXT[{i}] degree {deg} exceeds budget {DEGREE_BUDGET}");
+        }
+
+        let base = builder.base_constraints();
+        println!("enforce_chiplet: {} base constraints", base.len());
+        for (i, c) in base.iter().enumerate() {
+            let deg = c.degree_multiple();
+            assert!(deg <= DEGREE_BUDGET, "BASE[{i}] degree {deg} exceeds budget {DEGREE_BUDGET}");
+        }
+    }
+}
+
