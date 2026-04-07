@@ -11,6 +11,7 @@ Here are some resources to learn more about STARKs:
 
 - STARKs paper: [Scalable, transparent, and post-quantum secure computational integrity](https://eprint.iacr.org/2018/046)
 - STARKs vs. SNARKs: [A Cambrian Explosion of Crypto Proofs](https://nakamoto.com/cambrian-explosion-of-crypto-proofs/)
+- Survey: [Proofs, Arguments, and Zero-Knowledge](https://people.cs.georgetown.edu/jthaler/ProofsArgsAndZK.html) by Justin Thaler — a comprehensive, freely available textbook covering the full landscape of proof systems including STARKs
 
 Vitalik Buterin's blog series on zk-STARKs:
 
@@ -34,3 +35,14 @@ StarkWare's STARK Math blog series:
 StarkWare's STARK tutorial:
 
 - [STARK 101](https://starkware.co/stark-101/)
+
+## FRI Protocol
+
+The FRI (Fast Reed-Solomon Interactive Oracle Proof of Proximity) protocol is a core building block of STARK proof systems, used to efficiently prove that a committed polynomial has low degree.
+
+- [DEEP-FRI: Sampling Outside the Box Improves Soundness](https://eprint.iacr.org/2019/336) — the DEEP variant used in production STARK systems
+- [FRI Soundness Analysis](https://eccc.weizmann.ac.il/report/2017/134/) by Ben-Sasson, Bentov, Horesh, Riabzev
+
+## Plonky3
+
+Miden VM uses [Plonky3](https://github.com/0xMiden/Plonky3) as its underlying proving system. Plonky3 is a toolkit for implementing polynomial IOPs (PIOPs), designed for performance and modularity. See the [`p3-miden`](https://github.com/0xMiden/p3-miden) repository for the Miden-specific integration.
