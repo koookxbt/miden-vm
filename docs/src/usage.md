@@ -39,7 +39,7 @@ make exec-single
 
 ### Controlling parallelism
 
-Internally, Miden VM uses [rayon](https://github.com/rayon-rs/rayon) for parallel computations. To control the number of threads used to generate a STARK proof, you can use `RAYON_NUM_THREADS` environment variable.
+Internally, Miden VM uses [rayon](https://github.com/rayon-rs/rayon) for parallel computations. To control the number of threads used to generate a STARK proof, you can use `RAYON_NUM_THREADS` environment variable. Setting it to `0` lets rayon choose the number of threads automatically based on the number of available CPU cores.
 
 ### SIMD acceleration
 
@@ -71,11 +71,11 @@ Once the executable has been compiled, you can run Miden VM like so:
 
 Currently, Miden VM can be executed with the following subcommands:
 
-- `run` - this will execute a Miden assembly program and output the result, but will not generate a proof of execution.
-- `prove` - this will execute a Miden assembly program, and will also generate a STARK proof of execution.
-- `verify` - this will verify a previously generated proof of execution for a given program.
-- `compile` - this will compile a Miden assembly program (i.e., build a program [MAST](./design/programs.md)) and outputs stats about the compilation process.
-- `example` - this will execute a Miden assembly example program, generate a STARK proof of execution and verify it. Currently, it is possible to run `blake3` and `fibonacci` examples.
+- `run` - executes a Miden assembly program and outputs the result, but does not generate a proof of execution.
+- `prove` - executes a Miden assembly program and generates a STARK proof of execution that can later be verified with the `verify` subcommand.
+- `verify` - verifies a previously generated proof of execution for a given program.
+- `compile` - compiles a Miden assembly program (i.e., builds a program [MAST](./design/programs.md)) and outputs stats about the compilation process.
+- `example` - executes a built-in Miden assembly example program, generates a STARK proof of execution, and verifies it. Currently available examples are `blake3` and `fibonacci`.
 
 All of the above subcommands require various parameters to be provided. To get more detailed help on what is needed for a given subcommand, you can run the following:
 
@@ -93,58 +93,18 @@ To execute a program using the Miden VM there needs to be a `.masm` file contain
 
 #### Enabling logging
 
-You can use `MIDEN_LOG` environment variable to control how much logging output the VM produces. For example:
+Miden VM uses the [tracing](https://crates.io/crates/tracing) crate for logging. To enable basic logging, set the `MIDEN_LOG` environment variable to the desired log level (e.g., `info`, `debug`, or `trace`):
 
 ```shell
-MIDEN_LOG=trace ./target/optimized/miden-vm [subcommand] [parameters]
+MIDEN_LOG=info ./target/optimized/miden-vm run ...
 ```
 
-If the level is not specified, `warn` level is set as default.
+### Fibonacci example
 
-#### Enable Debugging features
-
-You can use the run command with `--debug` parameter to enable debugging with the [debug instruction](./user_docs/assembly/debugging.md) such as `debug.stack`:
+To execute the Fibonacci example:
 
 ```shell
-./target/optimized/miden-vm run [path_to.masm] --debug
-```
-
-If trace building would exceed the VM trace row limit, `run` returns a trace length error instead of trying to build a larger trace.
-
-### Inputs
-
-As described [here](https://docs.miden.xyz/miden-vm/overview#inputs-and-outputs) the Miden VM can consume public and secret inputs.
-
-- Public inputs:
-  - `operand_stack` - can be supplied to the VM to initialize the stack with the desired values before a program starts executing. If the number of provided input values is less than 16, the input stack will be padded with zeros to the length of 16. The maximum number of the stack inputs is limited by 16 values, providing more than 16 values will cause an error.
-- Secret (or nondeterministic) inputs:
-  - `advice_stack` - can be supplied to the VM. There is no limit on how much data the advice provider can hold. This is provided as a string array where each string entry represents a field element.
-  - `advice_map` - is supplied as a map of 64-character hex keys, each mapped to an array of numbers. The hex keys are interpreted as 4 field elements and the arrays of numbers are interpreted as arrays of field elements.
-  - `merkle_store` - the Merkle store is container that allows the user to define `merkle_tree`, `sparse_merkle_tree` and `partial_merkle_tree` data structures.
-    - `merkle_tree` - is supplied as an array of 64-character hex values where each value represents a leaf (4 elements) in the tree.
-    - `sparse_merkle_tree` - is supplied as an array of tuples of the form (number, 64-character hex string). The number represents the leaf index and the hex string represents the leaf value (4 elements).
-    - `partial_merkle_tree` - is supplied as an array of tuples of the form ((number, number), 64-character hex string). The internal tuple represents the leaf depth and index at this depth, and the hex string represents the leaf value (4 elements).
-
-_Check out the [comparison example](https://github.com/0xMiden/examples/blob/main/examples/comparison.masm) to see how secret inputs work._
-
-After a program finishes executing, the elements that remain on the stack become the outputs of the program. Notice that the number of values on the operand stack at the end of the program execution can not be greater than 16, otherwise the program will return an error. The [`truncate_stack`](./user_docs/core_lib/sys.md) utility procedure from the core library could be used to conveniently truncate the stack at the end of the program.
-
-## Fibonacci example
-
-In the `miden-vm/masm-examples/fib` directory, we provide a very simple Fibonacci calculator example. This example computes the 1001st term of the Fibonacci sequence. You can execute this example on Miden VM like so:
-
-```shell
-./target/optimized/miden-vm run miden-vm/masm-examples/fib/fib.masm
-```
-
-### Capturing Output
-
-This will run the example code to completion and will output the top element remaining on the stack.
-
-If you want the output of the program in a file, you can use the `--output` or `-o` flag and specify the path to the output file. For example:
-
-```shell
-./target/optimized/miden-vm run miden-vm/masm-examples/fib/fib.masm -o fib.out
+./target/optimized/miden-vm run miden-vm/masm-examples/fib/fib.masm -n 1
 ```
 
 This will dump the output of the program into the `fib.out` file. The output file will contain the state of the stack at the end of the program execution.
